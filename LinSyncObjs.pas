@@ -30,9 +30,9 @@
              problems. Use them with caution and if you find any bugs, please
              report them.
 
-  Version 1.0 (2022-08-05)
+  Version 1.0.2 (2022-08-13)
 
-  Last change 2022-08-05
+  Last change 2022-08-13
 
   ©2022 František Milt
 
@@ -107,11 +107,6 @@ type
   ELSOOpenError       = class(ELSOException);
   ELSOInvalidLockType = class(ELSOException);
   ELSOInvalidObject   = class(ELSOException);
-
-  ELSOFutexOpError = class(ELSOException);
-
-  ELSOMultiWaitError   = class(ELSOException);
-  ELSOIndexOutOfBounds = class(ELSOException);
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -730,12 +725,7 @@ type
 --------------------------------------------------------------------------------
 ===============================================================================}
 {
-  Value of output variable Index is undefined in most cases. Only when WaitAll
-  is set to false and the function returns with result being wrSignaled the
-  index will contain zero-based index of object that caused the function to
-  return.
-
-  Given the implementation, there are limitations in effect for the following
+  Given the implementation, there are limitations in effect for multi-wait
   functions, those are:
 
     - there is a system-wide limit of 15360 concurently running instances of
@@ -747,7 +737,26 @@ type
     - the number of events in parameter Objects is not strictly limited, but it
       is not recommended to go above 32 (there is a technical limit of about 4
       bilion objects)
+
+
+  When WaitAll is set to false and the function returns wrSignaled, then the
+  output parameter Index will contain zero-based index of object that caused
+  the function to return.
+
+  When wrError is returned, then the index is set to one of the following error
+  codes to indicate what caused the function to fail.
+
+  In all other cases, the value of Index is undefined.
 }
+const
+  LSO_WAITERROR_UNKNOWN   = 1;  // some unknown or unspecified error
+  LSO_WAITERROR_COUNT     = 2;  // zero object count
+  LSO_WAITERROR_OBJECTS   = 3;  // invalid object(s) (unassigned, duplicate, ...)
+  LSO_WAITERROR_NOSLOT    = 4;  // reached limit of concurently running instances of multi-wait
+  LSO_WAITERROR_EVENTFULL = 5;  // at least one event has full waiter array and cannot be waited upon
+  LSO_WAITERROR_FUTEXWAIT = 6;  // error in internla waiting mechanism
+
+//------------------------------------------------------------------------------
 
 Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
 Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
@@ -1962,7 +1971,7 @@ begin
 If CheckIndex(SlotIndex) then
   Result := PFutexWord(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutexWord)))
 else
-  raise ELSOIndexOutOfBounds.CreateFmt('TLSOMultiWaitSlots.GetSlot: Slot index (%d) out of bounds.',[SlotIndex]);
+  Result := nil;
 end;
 
 //------------------------------------------------------------------------------
@@ -2025,8 +2034,7 @@ try
     begin
       fSlotMap[SlotIndex] := False;
       PFutexWord(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutexWord)))^ := 0;
-    end
-  else ELSOIndexOutOfBounds.CreateFmt('TLSOMultiWaitSlots.InvalidateSlot: Slot index (%d) out of bounds.',[SlotIndex]);
+    end;
 finally
   Unlock;
 end;
@@ -3835,6 +3843,14 @@ end;
 
 Function WaitForMultipleEvents_Internal(Objects: array of PLSOEvent; Timeout: DWORD; WaitAll: Boolean; out Index: Integer): TLSOWaitResult;
 
+  procedure ReturnError(ErrorCode: Integer);
+  begin
+    Index := ErrorCode;
+    Result := wrError;
+  end;
+
+//   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
+
   Function CheckObjects: Boolean;
   var
     i,j:  Integer;
@@ -3981,51 +3997,56 @@ var
 
 begin
 Index := -1;
-If CheckObjects then
-  begin
-    If MultiWaitSlots.GetFreeSlotIndex(WaiterFutexIdx) then
-      try
-        // init waiter futex
-        WaiterFutexPtr := MultiWaitSlots[WaiterFutexIdx];
-        InterlockedStore(WaiterFutexPtr^,Length(Objects));
-        // add waiter futex to all events
-        If AddSelfToWaiters then
-          try
-            // wait on the waiter futex
-            TimeoutRemaining := Timeout;
-            GetTime(StartTime);
-            Counter := Length(Objects);
-            repeat
-              ExitWait := True;
-              If not WaitAll then
-                Counter := Length(Objects);
-              case FutexWait(WaiterFutexPtr^,TFutexWord(Counter),TimeoutRemaining) of
-                fwrWoken,
-                fwrValue:       ProcessEvents;
-                fwrTimeout:     Result := wrTimeout;  // exit with timeout
-                fwrInterrupted: ExitWait := False;    // recalculate timeout and re-enter waiting
-              else
-                Result := wrError;
-              end;
-              // recalculate timeout if not exiting
-              If not ExitWait then
-                If not RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
-                  begin
-                    Result := wrTimeout;
-                    ExitWait := True;
-                  end;
-            until ExitWait;
-          finally
-            // remove waiter futex from all events
-            RemoveSelfFromWaiters;
-          end;
-      finally
-        // return waiter futex
-        MultiWaitSlots.InvalidateSlot(WaiterFutexIdx);
-      end
-    else raise ELSOMultiWaitError.Create('WaitForMultipleEvents_Internal: No wait slot available.');
-  end
-else raise ELSOMultiWaitError.Create('WaitForMultipleEvents_Internal: Invalid objects array.');
+try
+  If CheckObjects then
+    begin
+      If MultiWaitSlots.GetFreeSlotIndex(WaiterFutexIdx) then
+        try
+          // init waiter futex
+          WaiterFutexPtr := MultiWaitSlots[WaiterFutexIdx];
+          InterlockedStore(WaiterFutexPtr^,Length(Objects));
+          // add waiter futex to all events
+          If AddSelfToWaiters then
+            try
+              // wait on the waiter futex
+              TimeoutRemaining := Timeout;
+              GetTime(StartTime);
+              Counter := Length(Objects);
+              repeat
+                ExitWait := True;
+                If not WaitAll then
+                  Counter := Length(Objects);
+                case FutexWait(WaiterFutexPtr^,TFutexWord(Counter),TimeoutRemaining) of
+                  fwrWoken,
+                  fwrValue:       ProcessEvents;
+                  fwrTimeout:     Result := wrTimeout;  // exit with timeout
+                  fwrInterrupted: ExitWait := False;    // recalculate timeout and re-enter waiting
+                else
+                  ReturnError(LSO_WAITERROR_FUTEXWAIT);
+                end;
+                // recalculate timeout if not exiting
+                If not ExitWait then
+                  If not RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
+                    begin
+                      Result := wrTimeout;
+                      ExitWait := True;
+                    end;
+              until ExitWait;
+            finally
+              // remove waiter futex from all events
+              RemoveSelfFromWaiters;
+            end
+          else ReturnError(LSO_WAITERROR_EVENTFULL);
+        finally
+          // return waiter futex
+          MultiWaitSlots.InvalidateSlot(WaiterFutexIdx);
+        end
+      else ReturnError(LSO_WAITERROR_NOSLOT);
+    end
+  else ReturnError(LSO_WAITERROR_OBJECTS);
+except
+  ReturnError(LSO_WAITERROR_UNKNOWN);
+end;
 end;
 
 {===============================================================================
@@ -4033,23 +4054,34 @@ end;
 ===============================================================================}
 
 Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
+
+  procedure ReturnError(ErrorCode: Integer);
+  begin
+    Index := ErrorCode;
+    Result := wrError;
+  end;
+
 begin
 Index := -1;
-If Length(Objects) > 1 then
-   Result := WaitForMultipleEvents_Internal(Objects,Timeout,WaitAll,Index)
-else If Length(Objects) = 1 then
-  begin
-    Index := 0;
-    If not CheckResErr(event_timedwait(Objects[0],Timeout)) then
-      begin
-        If ThrErrorCode = ESysETIMEDOUT then
-          Result := wrTimeout
-        else
-          Result := wrError;
-      end
-    else Result := wrSignaled;
-  end
-else raise ELSOMultiWaitError.CreateFmt('WaitForMultipleEvents: Invalid object count (%d).',[Length(Objects)]);
+try
+  If Length(Objects) > 1 then
+     Result := WaitForMultipleEvents_Internal(Objects,Timeout,WaitAll,Index)
+  else If Length(Objects) = 1 then
+    begin
+      Index := 0;
+      If not CheckResErr(event_timedwait(Objects[0],Timeout)) then
+        begin
+          If ThrErrorCode = ESysETIMEDOUT then
+            Result := wrTimeout
+          else
+            ReturnError(LSO_WAITERROR_FUTEXWAIT);
+        end
+      else Result := wrSignaled;
+    end
+  else ReturnError(LSO_WAITERROR_COUNT);
+except
+  ReturnError(LSO_WAITERROR_UNKNOWN);
+end;
 end;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
